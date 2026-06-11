@@ -30,7 +30,13 @@ import {
 
 const app = express();
 app.set("trust proxy", 1);
-app.use(cors());
+
+// 전세계 어떤 AI 에이전트든 접근 가능 — origin 무제한 허용
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
 app.use(express.json());
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
