@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  background-color: #0a0f1a;
+  color: #f8fafc;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── 💰 Coin particle animation ─────────────────────────────────────────── */
+@keyframes coin-float {
+  0%   { transform: translateY(0)      scale(1);   opacity: 1; }
+  60%  { transform: translateY(-80px)  scale(1.2); opacity: 0.9; }
+  100% { transform: translateY(-140px) scale(0.4); opacity: 0; }
+}
+
+.coin-particle {
+  position: fixed;
+  pointer-events: none;
+  font-size: 26px;
+  z-index: 9999;
+  animation: coin-float 1.6s ease-out forwards;
+  filter: drop-shadow(0 0 8px rgba(251, 191, 36, 0.8));
+}
+
+/* ── Scrollbar ───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar          { width: 5px; }
+::-webkit-scrollbar-track    { background: #1e293b; }
+::-webkit-scrollbar-thumb    { background: #334155; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #475569; }
+
+/* ── React Flow dark overrides ──────────────────────────────────────────── */
+.react-flow__controls {
+  background: #1e293b !important;
+  border: 1px solid #334155 !important;
+  border-radius: 8px !important;
+}
+.react-flow__controls-button {
+  background: transparent !important;
+  border: none !important;
+  color: #94a3b8 !important;
+}
+.react-flow__controls-button:hover {
+  background: #334155 !important;
+  color: #f8fafc !important;
+}

@@ -1,0 +1,404 @@
+import "dotenv/config";
+import express, { Request, Response, NextFunction } from "express";
+import http from "http";
+import cors from "cors";
+import { WebSocketServer, WebSocket } from "ws";
+import { generateDid, validateDid, buildDidDocument } from "./auth/did";
+import {
+  createToken,
+  verifyToken,
+  verifySignature,
+  issueAiChallenge,
+  verifyAiChallenge,
+} from "./auth/verify";
+import { isBlacklisted, addToBlacklist, recordReport } from "./blacklist/guard";
+import { router } from "./hub/router";
+import { getPlazaStats } from "./hub/broadcast";
+import { notifyDealConfirmed } from "./hub/broadcast";
+import { getAgentFromChain, getDealFromChain, recordDealOnChain } from "./bridge/onchain";
+import { getAgentStatus } from "./reputation/score";
+import { startReputationListener } from "./reputation/updater";
+import { initSchema, logNegotiation, updateNegotiationStatus } from "./db/postgres";
+import { HubMessage, KnowledgeCategory } from "./types/agent";
+import {
+  getRecentKnowledge,
+  getKnowledgeByTopic,
+  getKnowledgeByCategory,
+  getKnowledgeById,
+  getKnowledgeStats,
+} from "./knowledge/store";
+
+const app = express();
+app.set("trust proxy", 1);
+app.use(cors());
+app.use(express.json());
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
+
+function requireJwt(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: "missing_token" });
+    return;
+  }
+  const payload = verifyToken(token);
+  if (!payload) {
+    res.status(401).json({ error: "invalid_token" });
+    return;
+  }
+  (req as Request & { agent: typeof payload }).agent = payload;
+  next();
+}
+
+// ── Health ────────────────────────────────────────────────────────────────────
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "hivagora-backend", ts: Date.now() });
+});
+
+// ── Agent endpoints ───────────────────────────────────────────────────────────
+
+/**
+ * POST /agent/register
+ * Body: { address, signature, message, capabilities, endpoint }
+ * → Verifies Ethereum signature, issues DID + JWT
+ */
+app.post("/agent/register", async (req: Request, res: Response): Promise<void> => {
+  const { address, signature, message, capabilities = [], endpoint = "" } = req.body as {
+    address: string;
+    signature: string;
+    message: string;
+    capabilities: string[];
+    endpoint: string;
+  };
+
+  if (!address || !signature || !message) {
+    res.status(400).json({ error: "missing_fields", required: ["address", "signature", "message"] });
+    return;
+  }
+
+  const valid = await verifySignature(message, signature, address);
+  if (!valid) {
+    res.status(401).json({ error: "invalid_signature" });
+    return;
+  }
+
+  const did = generateDid(address);
+
+  if (await isBlacklisted(did)) {
+    res.status(403).json({ error: "blacklisted", did });
+    return;
+  }
+
+  const token = createToken(did, address);
+  const didDocument = buildDidDocument(did, endpoint);
+
+  res.json({ did, token, didDocument, capabilities });
+});
+
+/**
+ * GET /agent/verify/challenge
+ * → Issues an AI proof-of-work challenge (reverse Turing test)
+ */
+app.get("/agent/verify/challenge", (_req: Request, res: Response) => {
+  const challenge = issueAiChallenge();
+  res.json(challenge);
+});
+
+/**
+ * POST /agent/verify
+ * Body: { nonce, answer }
+ * → Verifies PoW response within 1s window — proves AI capability
+ */
+app.post("/agent/verify", (req: Request, res: Response): void => {
+  const { nonce, answer } = req.body as { nonce: string; answer: string };
+  if (!nonce || !answer) {
+    res.status(400).json({ error: "missing_fields", required: ["nonce", "answer"] });
+    return;
+  }
+
+  const verified = verifyAiChallenge(nonce, answer);
+  if (!verified) {
+    res.status(401).json({ error: "verification_failed", hint: "Too slow or wrong answer" });
+    return;
+  }
+
+  res.json({ verified: true, isAI: true, ts: Date.now() });
+});
+
+/**
+ * GET /agent/:did
+ * → Returns agent info (on-chain data + reputation score)
+ */
+app.get("/agent/*did", async (req: Request, res: Response): Promise<void> => {
+  const did = decodeURIComponent(String(req.params["did"]));
+
+  if (!validateDid(did)) {
+    res.status(400).json({ error: "invalid_did" });
+    return;
+  }
+
+  const [agent, status] = await Promise.all([
+    getAgentFromChain(did),
+    getAgentStatus(did),
+  ]);
+
+  if (!agent) {
+    res.status(404).json({ error: "agent_not_found", did });
+    return;
+  }
+
+  res.json({ ...agent, reputation: status.score, isActive: status.isActive });
+});
+
+/**
+ * POST /agent/report
+ * Body: { targetDid, reason }
+ * Auth: Bearer JWT required
+ */
+app.post("/agent/report", requireJwt, async (req: Request, res: Response): Promise<void> => {
+  const { targetDid, reason = "unspecified" } = req.body as { targetDid: string; reason: string };
+  const reporterDid = (req as Request & { agent: { did: string } }).agent.did;
+
+  if (!targetDid) {
+    res.status(400).json({ error: "missing_fields", required: ["targetDid"] });
+    return;
+  }
+
+  if (!validateDid(targetDid)) {
+    res.status(400).json({ error: "invalid_did" });
+    return;
+  }
+
+  if (targetDid === reporterDid) {
+    res.status(400).json({ error: "cannot_report_self" });
+    return;
+  }
+
+  const reportCount = await recordReport(targetDid, reporterDid, reason);
+  const blacklisted = reportCount >= 3;
+
+  res.json({ reported: true, targetDid, reportCount, blacklisted });
+});
+
+// ── Deal endpoints ────────────────────────────────────────────────────────────
+
+/**
+ * GET /deals/:dealHash
+ * → Fetches on-chain deal record by dealHash (SHA-256 hex string)
+ */
+app.get("/deals/:dealId", async (req: Request, res: Response): Promise<void> => {
+  const dealId = String(req.params["dealId"]);
+  const deal = await getDealFromChain(dealId);
+
+  if (!deal || !deal.dealId) {
+    res.status(404).json({ error: "deal_not_found", dealId });
+    return;
+  }
+
+  res.json(deal);
+});
+
+/**
+ * POST /deals/accept   (internal — called by agent via hub accept message)
+ * Body: { dealId, agentA, agentB, content, amountKrw }
+ * Auth: Bearer JWT required
+ */
+app.post("/deals/accept", requireJwt, async (req: Request, res: Response): Promise<void> => {
+  const { dealId, agentA, agentB, content, amountKrw = 0 } = req.body as {
+    dealId: string;
+    agentA: string;
+    agentB: string;
+    content: unknown;
+    amountKrw: number;
+  };
+
+  if (!dealId || !agentA || !agentB) {
+    res.status(400).json({ error: "missing_fields" });
+    return;
+  }
+
+  // Log off-chain first
+  await logNegotiation({ dealId, agentA, agentB, amountKrw });
+
+  try {
+    const result = await recordDealOnChain(dealId, agentA, agentB, content);
+    await updateNegotiationStatus(dealId, "confirmed", result.txHash, result.dealHash);
+
+    // Notify both agents via WebSocket
+    notifyDealConfirmed(agentA, dealId, result.txHash);
+    notifyDealConfirmed(agentB, dealId, result.txHash);
+
+    res.json({
+      dealId,
+      txHash: result.txHash,
+      dealHash: result.dealHash,
+      blockNumber: result.blockNumber,
+      requiresApproval: amountKrw >= 100_000,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "On-chain recording failed";
+    res.status(502).json({ error: "chain_error", message: msg });
+  }
+});
+
+// ── Reputation endpoint ───────────────────────────────────────────────────────
+
+/**
+ * GET /reputation/:did
+ */
+app.get("/reputation/*did", async (req: Request, res: Response): Promise<void> => {
+  const did = decodeURIComponent(String(req.params["did"]));
+
+  if (!validateDid(did)) {
+    res.status(400).json({ error: "invalid_did" });
+    return;
+  }
+
+  const status = await getAgentStatus(did);
+  res.json(status);
+});
+
+// ── Plaza stats ───────────────────────────────────────────────────────────────
+
+app.get("/plaza/stats", (_req, res) => {
+  res.json(getPlazaStats());
+});
+
+// ── Knowledge Network API ─────────────────────────────────────────────────────
+
+/**
+ * GET /knowledge
+ * 최근 공유된 지식 목록 (에이전트들이 공유한 시장 인텔리전스)
+ */
+app.get("/knowledge", async (_req: Request, res: Response) => {
+  const entries = await getRecentKnowledge(30);
+  const stats = await getKnowledgeStats();
+  res.json({ entries, stats, onlineAgents: router.getOnlineAgents().length });
+});
+
+/**
+ * GET /knowledge/topic/:topic
+ * 특정 주제의 지식 검색 (예: /knowledge/topic/price:아이폰15)
+ */
+app.get("/knowledge/topic/:topic", async (req: Request, res: Response) => {
+  const topic = decodeURIComponent(String(req.params["topic"]));
+  const limit = Math.min(Number(req.query.limit ?? 10), 30);
+  const entries = await getKnowledgeByTopic(topic, limit);
+  res.json({ topic, count: entries.length, entries });
+});
+
+/**
+ * GET /knowledge/category/:category
+ * 카테고리별 지식 (price | trend | market | deal | review | general)
+ */
+app.get("/knowledge/category/:category", async (req: Request, res: Response) => {
+  const category = String(req.params["category"]) as KnowledgeCategory;
+  const limit = Math.min(Number(req.query.limit ?? 20), 50);
+  const entries = await getKnowledgeByCategory(category, limit);
+  res.json({ category, count: entries.length, entries });
+});
+
+/**
+ * GET /knowledge/:id
+ * 개별 지식 항목 조회
+ */
+app.get("/knowledge/:id", async (req: Request, res: Response): Promise<void> => {
+  const entry = await getKnowledgeById(String(req.params["id"]));
+  if (!entry) {
+    res.status(404).json({ error: "not_found" });
+    return;
+  }
+  res.json(entry);
+});
+
+// ── Error handler ─────────────────────────────────────────────────────────────
+
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const message = err instanceof Error ? err.message : "Internal server error";
+  console.error("[Error]", message);
+  res.status(500).json({ error: "internal_error", message });
+});
+
+// ── WebSocket /hivagora/hub ───────────────────────────────────────────────────
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  if (!request.url?.startsWith("/hivagora/hub")) {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request);
+  });
+});
+
+wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
+  const url = new URL(req.url ?? "", "http://localhost");
+  const token = url.searchParams.get("token");
+
+  // Plaza monitor — read-only observer, no message send
+  if (token === "plaza-monitor-token") {
+    const monitorDid = `did:hivagora:monitor:${Date.now()}`;
+    router.registerClient(monitorDid, ws);
+    ws.on("close", () => router.removeClient(monitorDid));
+    return;
+  }
+
+  if (!token) {
+    ws.close(4001, "Token required");
+    return;
+  }
+
+  const payload = verifyToken(token);
+  if (!payload) {
+    ws.close(4002, "Invalid token");
+    return;
+  }
+
+  const { did } = payload;
+
+  // Blacklist check before admitting
+  if (await isBlacklisted(did)) {
+    ws.close(4403, "Blacklisted");
+    return;
+  }
+
+  router.registerClient(did, ws);
+
+  ws.on("message", async (data) => {
+    await router.handleMessage(data.toString(), did);
+  });
+
+  ws.on("close", () => {
+    router.removeClient(did);
+  });
+
+  ws.on("error", (err) => {
+    console.error(`[WS] Error for ${did}:`, err.message);
+    router.removeClient(did);
+  });
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+
+const PORT = parseInt(process.env.PORT ?? "4001", 10);
+
+server.listen(PORT, "0.0.0.0", async () => {
+  console.log(`[Hivagora Backend] Listening on port ${PORT}`);
+
+  // Initialize PostgreSQL schema (non-fatal if DB not available)
+  if (process.env.DATABASE_URL) {
+    await initSchema().catch((e: Error) =>
+      console.warn("[PG] Schema init skipped:", e.message)
+    );
+  }
+
+  // Start on-chain event listener
+  startReputationListener();
+});
+
+export default server;
