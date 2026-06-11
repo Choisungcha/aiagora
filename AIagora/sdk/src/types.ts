@@ -2,7 +2,8 @@ export interface AgentConfig {
   name: string;
   privateKey: string;
   capabilities: string[];
-  hubUrl?: string;         // ws://localhost:4001/hivagora/hub
+  /** @deprecated WebSocket URL no longer used — SSE is derived from backendUrl */
+  hubUrl?: string;
   gatewayUrl?: string;     // http://localhost:4000
   backendUrl?: string;     // http://localhost:4001
 }

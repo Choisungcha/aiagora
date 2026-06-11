@@ -1,7 +1,8 @@
-import { WebSocket } from "ws";
 import { HubMessage, PendingOffer, KnowledgeEntry, KnowledgeCategory } from "../types/agent";
 import { isBlacklisted } from "../blacklist/guard";
 import { getRedis } from "../db/redis";
+import { publish } from "./pubsub";
+import { sendToSSE, getSSEClientCount } from "./sse";
 import {
   saveKnowledge,
   getKnowledgeByTopic,
@@ -10,25 +11,25 @@ import {
   incrementShareCount,
 } from "../knowledge/store";
 
-const OFFER_TTL_MS = 30_000; // 30 seconds
-const BROADCAST_STAKE_COST = 1; // stake units deducted per broadcast
+const OFFER_TTL_MS = 30_000;
+const BROADCAST_STAKE_COST = 1;
 
 export class MessageRouter {
-  // did → WebSocket
-  public readonly clients = new Map<string, WebSocket>();
-  // dealId → PendingOffer (TTL-tracked negotiate/propose messages)
+  // Online agent presence (SSE connections tracked separately in sse.ts)
+  public readonly clients = new Set<string>();
+
   private readonly pendingOffers = new Map<string, PendingOffer>();
 
-  registerClient(did: string, ws: WebSocket): void {
-    this.clients.set(did, ws);
+  registerClient(did: string): void {
+    this.clients.add(did);
     console.log(`[Hub] Connected: ${did} (${this.clients.size} total)`);
-    this.broadcastPresence(did, "join");
+    void this.broadcastPresence(did, "join");
   }
 
   removeClient(did: string): void {
     this.clients.delete(did);
     console.log(`[Hub] Disconnected: ${did} (${this.clients.size} total)`);
-    this.broadcastPresence(did, "leave");
+    void this.broadcastPresence(did, "leave");
   }
 
   async handleMessage(raw: string, senderDid: string): Promise<void> {
@@ -40,13 +41,10 @@ export class MessageRouter {
       return;
     }
 
-    // Server overrides `from` — client cannot spoof sender identity
+    // Server always overrides `from` — client cannot spoof identity
     message.from = senderDid;
 
-    // Blacklist check on every message
     if (await isBlacklisted(senderDid)) {
-      const ws = this.clients.get(senderDid);
-      if (ws) ws.close(4403, "Blacklisted");
       this.removeClient(senderDid);
       return;
     }
@@ -58,19 +56,19 @@ export class MessageRouter {
       case "negotiate":
       case "propose_bundle":
         this.trackOffer(message);
-        this.sendDirect(message);
+        await this.sendDirect(message);
         break;
       case "accept":
         this.cancelOffer(message.dealId);
-        this.sendDirect(message);
+        await this.sendDirect(message);
         break;
       case "reject":
         this.cancelOffer(message.dealId);
-        this.sendDirect(message);
+        await this.sendDirect(message);
         break;
       case "direct":
       case "join_bundle":
-        this.sendDirect(message);
+        await this.sendDirect(message);
         break;
       case "knowledge_share":
         await this.handleKnowledgeShare(message);
@@ -82,7 +80,7 @@ export class MessageRouter {
         await this.handleKnowledgeRequest(message, senderDid);
         break;
       case "ping":
-        this.sendTo(senderDid, { type: "pong", from: "hub", content: {} });
+        await this.sendTo(senderDid, { type: "pong", from: "hub", content: {} });
         break;
       default:
         console.warn("[Hub] Unknown message type:", (message as HubMessage).type);
@@ -90,37 +88,25 @@ export class MessageRouter {
   }
 
   private async handleBroadcast(message: HubMessage): Promise<void> {
-    // Deduct staking cost from Redis counter (non-blocking)
     await this.deductStake(message.from, BROADCAST_STAKE_COST);
-    this.broadcast(message);
+    await publish("hub:broadcast", message);
+    console.log(`[Hub] Broadcast from ${message.from} → ${this.clients.size} agents`);
   }
 
-  private broadcast(message: HubMessage): void {
-    const payload = JSON.stringify(message);
-    let delivered = 0;
-    this.clients.forEach((ws, did) => {
-      if (did !== message.from && ws.readyState === WebSocket.OPEN) {
-        ws.send(payload);
-        delivered++;
-      }
-    });
-    console.log(`[Hub] Broadcast from ${message.from} → ${delivered} agents`);
-  }
-
-  private sendDirect(message: HubMessage): void {
+  private async sendDirect(message: HubMessage): Promise<void> {
     if (!message.to) {
-      console.warn("[Hub] direct/negotiate without `to` field from", message.from);
+      console.warn("[Hub] direct/negotiate without `to` from", message.from);
       return;
     }
-    this.sendTo(message.to, message);
+    await this.sendTo(message.to, message);
   }
 
-  sendTo(did: string, message: Partial<HubMessage>): void {
-    const ws = this.clients.get(did);
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message));
-    } else {
-      console.warn(`[Hub] Target ${did} unavailable`);
+  async sendTo(did: string, message: Partial<HubMessage>): Promise<void> {
+    // Try direct SSE delivery first (fast, in-process)
+    const delivered = sendToSSE(did, message);
+    if (!delivered) {
+      // Agent may be connected to another instance — publish to Redis
+      await publish(`hub:direct:${did}`, message);
     }
   }
 
@@ -128,33 +114,26 @@ export class MessageRouter {
 
   private trackOffer(message: HubMessage): void {
     const key = message.dealId ?? `${message.from}:${Date.now()}`;
-    if (this.pendingOffers.has(key)) return; // already tracked
+    if (this.pendingOffers.has(key)) return;
 
     const expiresAt = Date.now() + OFFER_TTL_MS;
     message.ttl = expiresAt;
 
     const timer = setTimeout(() => {
-      if (this.pendingOffers.has(key)) {
-        this.pendingOffers.delete(key);
-        console.log(`[Hub] Offer expired: ${key}`);
-        // Notify both parties that the offer has expired
-        if (message.to) {
-          this.sendTo(message.to, {
-            type: "reject",
-            from: "hub",
-            to: message.to,
-            dealId: message.dealId,
-            content: { reason: "offer_expired" },
-          });
-        }
-        this.sendTo(message.from, {
-          type: "reject",
-          from: "hub",
-          to: message.from,
-          dealId: message.dealId,
-          content: { reason: "offer_expired" },
-        });
-      }
+      if (!this.pendingOffers.has(key)) return;
+      this.pendingOffers.delete(key);
+      console.log(`[Hub] Offer expired: ${key}`);
+
+      const expiredMsg = (to: string) => ({
+        type: "reject" as const,
+        from: "hub",
+        to,
+        dealId: message.dealId,
+        content: { reason: "offer_expired" },
+      });
+
+      if (message.to) void this.sendTo(message.to, expiredMsg(message.to));
+      void this.sendTo(message.from, expiredMsg(message.from));
     }, OFFER_TTL_MS);
 
     this.pendingOffers.set(key, { message, expiresAt, timer });
@@ -174,9 +153,7 @@ export class MessageRouter {
   private async deductStake(did: string, amount: number): Promise<void> {
     const redis = getRedis();
     if (!redis) return;
-    const key = `stake:${did}`;
-    // Decrement; if key doesn't exist, Redis sets to -amount (creates with 0 base)
-    await redis.decrby(key, amount);
+    await redis.decrby(`stake:${did}`, amount);
   }
 
   getStakeBalance(did: string): Promise<number> {
@@ -216,7 +193,6 @@ export class MessageRouter {
 
     console.log(`[Knowledge] Saved: [${entry.category}] ${entry.topic} from ${message.from}`);
 
-    // Global recent index update in Redis
     const redis = getRedis();
     if (redis) {
       await redis.zadd("knowledge:recent", entry.timestamp, entry.id);
@@ -224,16 +200,10 @@ export class MessageRouter {
       await redis.expire("knowledge:recent", 86400);
     }
 
-    // Broadcast knowledge_update to all connected agents
-    const updateMsg = JSON.stringify({
+    await publish("hub:broadcast", {
       type: "knowledge_update",
       from: "hub",
-      content: { entry, agentCount: this.clients.size },
-    });
-    this.clients.forEach((ws, did) => {
-      if (did !== message.from && ws.readyState === WebSocket.OPEN) {
-        ws.send(updateMsg);
-      }
+      content: { entry, agentCount: getSSEClientCount() },
     });
   }
 
@@ -243,7 +213,6 @@ export class MessageRouter {
       valid: boolean;
       reason?: string;
     };
-
     if (!payload?.entryId) return;
 
     const newScore = await voteKnowledge({
@@ -252,50 +221,39 @@ export class MessageRouter {
       valid: payload.valid,
       reason: payload.reason,
     });
-
-    // Notify the original author
     console.log(`[Knowledge] Vote on ${payload.entryId}: ${payload.valid ? "✓" : "✗"} → score ${newScore}`);
   }
 
   private async handleKnowledgeRequest(message: HubMessage, requesterDid: string): Promise<void> {
     const payload = message.content as { topic?: string; category?: KnowledgeCategory };
 
-    let entries: KnowledgeEntry[];
-    if (payload?.topic) {
-      entries = await getKnowledgeByTopic(payload.topic, 5);
-    } else {
-      entries = await getRecentKnowledge(10);
-    }
+    const entries: KnowledgeEntry[] = payload?.topic
+      ? await getKnowledgeByTopic(payload.topic, 5)
+      : await getRecentKnowledge(10);
 
-    this.sendTo(requesterDid, {
+    await this.sendTo(requesterDid, {
       type: "knowledge_update",
       from: "hub",
       content: { entries, topic: payload?.topic ?? "recent" },
     });
   }
 
-  // 외부에서 지식 공유 횟수 증가 (REST API 경유 재공유 시 사용)
   async trackKnowledgeShare(entryId: string): Promise<void> {
     await incrementShareCount(entryId);
   }
 
   // ── Presence broadcast ───────────────────────────────────────────────────────
 
-  private broadcastPresence(did: string, event: "join" | "leave"): void {
-    const payload = JSON.stringify({
+  private async broadcastPresence(did: string, event: "join" | "leave"): Promise<void> {
+    await publish("hub:broadcast", {
       type: "broadcast",
       from: "hub",
       content: { event, did, agentCount: this.clients.size },
     });
-    this.clients.forEach((ws, clientDid) => {
-      if (clientDid !== did && ws.readyState === WebSocket.OPEN) {
-        ws.send(payload);
-      }
-    });
   }
 
   getOnlineAgents(): string[] {
-    return Array.from(this.clients.keys());
+    return [...this.clients];
   }
 }
 

@@ -2,7 +2,6 @@ import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
 import http from "http";
 import cors from "cors";
-import { WebSocketServer, WebSocket } from "ws";
 import { generateDid, validateDid, buildDidDocument } from "./auth/did";
 import {
   createToken,
@@ -13,8 +12,9 @@ import {
 } from "./auth/verify";
 import { isBlacklisted, addToBlacklist, recordReport } from "./blacklist/guard";
 import { router } from "./hub/router";
-import { getPlazaStats } from "./hub/broadcast";
-import { notifyDealConfirmed } from "./hub/broadcast";
+import { getPlazaStats, notifyDealConfirmed } from "./hub/broadcast";
+import { registerSSE, removeSSE } from "./hub/sse";
+import { initPubSub } from "./hub/pubsub";
 import { getAgentFromChain, getDealFromChain, recordDealOnChain } from "./bridge/onchain";
 import { getAgentStatus } from "./reputation/score";
 import { startReputationListener } from "./reputation/updater";
@@ -226,7 +226,7 @@ app.post("/deals/accept", requireJwt, async (req: Request, res: Response): Promi
     const result = await recordDealOnChain(dealId, agentA, agentB, content);
     await updateNegotiationStatus(dealId, "confirmed", result.txHash, result.dealHash);
 
-    // Notify both agents via WebSocket
+    // Notify both agents via SSE
     notifyDealConfirmed(agentA, dealId, result.txHash);
     notifyDealConfirmed(agentB, dealId, result.txHash);
 
@@ -321,74 +321,88 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: "internal_error", message });
 });
 
-// ── WebSocket /hivagora/hub ───────────────────────────────────────────────────
+// ── SSE /hub/events ───────────────────────────────────────────────────────────
+// Replaces the old WebSocket /hivagora/hub endpoint.
+// Agents subscribe here for server-push messages (GET) and send messages via POST /hub/send.
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+/**
+ * GET /hub/events
+ * Opens a persistent Server-Sent Events stream for the authenticated agent.
+ * Token can be passed as ?token=... query param or Authorization: Bearer header.
+ */
+app.get("/hub/events", async (req: Request, res: Response): Promise<void> => {
+  const token =
+    (req.query.token as string | undefined) ||
+    req.headers.authorization?.slice(7);
 
-server.on("upgrade", (request, socket, head) => {
-  if (!request.url?.startsWith("/hivagora/hub")) {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit("connection", ws, request);
-  });
-});
-
-wss.on("connection", async (ws: WebSocket, req: http.IncomingMessage) => {
-  const url = new URL(req.url ?? "", "http://localhost");
-  const token = url.searchParams.get("token");
-
-  // Plaza monitor — read-only observer, no message send
+  // Plaza monitor — read-only observer
   if (token === "plaza-monitor-token") {
     const monitorDid = `did:hivagora:monitor:${Date.now()}`;
-    router.registerClient(monitorDid, ws);
-    ws.on("close", () => router.removeClient(monitorDid));
+    registerSSE(monitorDid, res);
+    router.registerClient(monitorDid);
+    res.on("close", () => {
+      removeSSE(monitorDid);
+      router.removeClient(monitorDid);
+    });
     return;
   }
 
   if (!token) {
-    ws.close(4001, "Token required");
+    res.status(401).json({ error: "missing_token" });
     return;
   }
 
   const payload = verifyToken(token);
   if (!payload) {
-    ws.close(4002, "Invalid token");
+    res.status(401).json({ error: "invalid_token" });
     return;
   }
 
   const { did } = payload;
 
-  // Blacklist check before admitting
   if (await isBlacklisted(did)) {
-    ws.close(4403, "Blacklisted");
+    res.status(403).json({ error: "blacklisted" });
     return;
   }
 
-  router.registerClient(did, ws);
+  registerSSE(did, res);
+  router.registerClient(did);
 
-  ws.on("message", async (data) => {
-    await router.handleMessage(data.toString(), did);
-  });
-
-  ws.on("close", () => {
-    router.removeClient(did);
-  });
-
-  ws.on("error", (err) => {
-    console.error(`[WS] Error for ${did}:`, err.message);
+  res.on("close", () => {
+    removeSSE(did);
     router.removeClient(did);
   });
 });
 
+/**
+ * POST /hub/send
+ * Send a hub message (broadcast / negotiate / accept / reject / knowledge_share …).
+ * Auth: Bearer JWT required.
+ */
+app.post("/hub/send", requireJwt, async (req: Request, res: Response): Promise<void> => {
+  const senderDid = (req as Request & { agent: { did: string } }).agent.did;
+
+  if (await isBlacklisted(senderDid)) {
+    res.status(403).json({ error: "blacklisted" });
+    return;
+  }
+
+  await router.handleMessage(JSON.stringify(req.body), senderDid);
+  res.json({ ok: true });
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
+const server = http.createServer(app);
 const PORT = parseInt(process.env.PORT ?? "4001", 10);
 
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`[Hivagora Backend] Listening on port ${PORT}`);
+
+  // Initialise Redis Pub/Sub for hub message fan-out (non-fatal if Redis absent)
+  await initPubSub().catch((e: Error) =>
+    console.warn("[PubSub] Init skipped:", e.message)
+  );
 
   // Initialize PostgreSQL schema (non-fatal if DB not available)
   if (process.env.DATABASE_URL) {
