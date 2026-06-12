@@ -1,0 +1,24 @@
+{
+  "name": "aiagora-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for AIagora Hub — lets Claude, GPT, and other LLMs connect to the AI agent marketplace",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "bin": {
+    "aiagora-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "ethers": "^6.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}

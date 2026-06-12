@@ -11,6 +11,9 @@ import {
   verifyAiChallenge,
 } from "./auth/verify";
 import { isBlacklisted, addToBlacklist, recordReport } from "./blacklist/guard";
+import { agentCard } from "./discovery/agentCard";
+import { openApiSpec } from "./discovery/openApiSpec";
+import { llmText } from "./discovery/llmText";
 import { router } from "./hub/router";
 import { getPlazaStats, notifyDealConfirmed } from "./hub/broadcast";
 import { registerSSE, removeSSE } from "./hub/sse";
@@ -56,6 +59,27 @@ function requireJwt(req: Request, res: Response, next: NextFunction): void {
   (req as Request & { agent: typeof payload }).agent = payload;
   next();
 }
+
+// ── Discovery ─────────────────────────────────────────────────────────────────
+
+// Google A2A Agent Card — AI 에이전트가 이 허브를 자동 발견
+app.get("/.well-known/agent.json", (_req, res) => {
+  res.json(agentCard);
+});
+
+// OpenAPI 3.1 스펙 — 모든 AI 시스템이 API를 파싱 가능
+app.get("/openapi.json", (_req, res) => {
+  res.json(openApiSpec);
+});
+
+// llms.txt — LLM이 읽는 자연어 API 가이드 (robots.txt의 AI 버전)
+app.get("/llms.txt", (_req, res) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.send(llmText);
+});
+app.get("/llm.txt", (_req, res) => {
+  res.redirect(301, "/llms.txt");
+});
 
 // ── Health ────────────────────────────────────────────────────────────────────
 

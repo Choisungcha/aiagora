@@ -14,6 +14,8 @@ sdk/node_modules/
 api-gateway/node_modules/
 api-gateway/dist/
 demo-agents/node_modules/
+mcp-server/node_modules/
+mcp-server/dist/
 *.log
 .bkit/runtime/
 .bkit/audit/
