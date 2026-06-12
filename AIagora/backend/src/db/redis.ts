@@ -17,10 +17,14 @@ function makeClient(url: string): Redis {
   return c;
 }
 
+const REDIS_URL = process.env.REDIS_URL || (process.env.NODE_ENV !== "production" ? "redis://localhost:6379" : "");
+
 export function getRedis(): Redis | null {
+  if (!REDIS_URL) return null; // Railway 등 Redis 미설정 시 graceful skip
   if (client) return client;
   try {
-    client = makeClient(process.env.REDIS_URL ?? "redis://localhost:6379");
+    client = makeClient(REDIS_URL);
+    client.on("error", () => { client = null; });
     return client;
   } catch {
     return null;
@@ -28,9 +32,11 @@ export function getRedis(): Redis | null {
 }
 
 export function getPubClient(): Redis | null {
+  if (!REDIS_URL) return null;
   if (pubClient) return pubClient;
   try {
-    pubClient = makeClient(process.env.REDIS_URL ?? "redis://localhost:6379");
+    pubClient = makeClient(REDIS_URL);
+    pubClient.on("error", () => { pubClient = null; });
     return pubClient;
   } catch {
     return null;
@@ -38,9 +44,11 @@ export function getPubClient(): Redis | null {
 }
 
 export function getSubClient(): Redis | null {
+  if (!REDIS_URL) return null;
   if (subClient) return subClient;
   try {
-    subClient = makeClient(process.env.REDIS_URL ?? "redis://localhost:6379");
+    subClient = makeClient(REDIS_URL);
+    subClient.on("error", () => { subClient = null; });
     return subClient;
   } catch {
     return null;
